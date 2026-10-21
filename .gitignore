@@ -1,0 +1,21 @@
+.env
+amanewave.md
+修改意见.md
+coconna.md
+translate_pdf_hy_mt2.ps1
+work/
+models/
+amanewave术语表.json
+
+# Local audio and generated files
+*.aac
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# Python and editor caches
+__pycache__/
+.pytest_cache/
+.vscode/

@@ -1,0 +1,6 @@
+faster-whisper
+PyMuPDF
+requests
+pytest
+tqdm
+pykakasi
