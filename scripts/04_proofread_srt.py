@@ -1,6 +1,7 @@
 """Step 4: DeepSeek V4 Pro translation/proofreading -> bilingual SRT."""
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -153,6 +154,12 @@ _JAPANESE_PRONOUNS = (
 )
 _PROOFREAD_INTERJECTIONS = {"啊", "嗯", "哦", "哎", "唉", "欸", "诶", "喂", "哈"}
 _ROMANIZER = kakasi()
+DEFAULT_CONFIDENCE_THRESHOLD = -0.75
+
+
+def _confidence_percent(avg_logprob):
+    """Convert Whisper's average token log probability to a probability-like percent."""
+    return math.exp(min(avg_logprob, 0)) * 100
 
 
 def _romanize_japanese(text):
@@ -162,10 +169,13 @@ def _romanize_japanese(text):
     )
 
 
-def _quality_gate(japanese, drafts, terms=None):
+def _quality_gate(japanese, drafts, terms=None, confidence_scores=None,
+                  confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD):
     """Return 1-based row flags: normal rows are omitted, hard outranks suspect."""
     if len(japanese) != len(drafts):
         raise ValueError("日文字幕与初译数量不一致，无法执行质量门控")
+    if confidence_scores is not None and len(confidence_scores) != len(japanese):
+        raise ValueError("Whisper 置信度数量与字幕行数不一致")
 
     flags = {}
     for index, (source, draft) in enumerate(zip(japanese, drafts), 1):
@@ -205,6 +215,11 @@ def _quality_gate(japanese, drafts, terms=None):
             or bool(source_acronyms - draft_acronyms)
             or possible_entity_mismatch
             or term_mismatch
+            or (
+                confidence_scores is not None
+                and confidence_scores[index - 1] is not None
+                and confidence_scores[index - 1] <= confidence_threshold
+            )
         )
 
         pronoun_count = sum(source.count(pronoun) for pronoun in _JAPANESE_PRONOUNS)
@@ -244,10 +259,13 @@ def _quality_gate(japanese, drafts, terms=None):
 
 def deepseek_refine(ja_batch, zh_batch, numbers, base_url, key, model,
                     max_lines=40, thinking="disabled", max_tokens=8192,
-                    custom_prompt="", token_usage=None, romaji_batch=None):
+                    custom_prompt="", token_usage=None, romaji_batch=None,
+                    confidence_scores=None):
     """Refine selected numbered Japanese/draft pairs without changing source text."""
     if len(ja_batch) != len(zh_batch):
         raise ValueError("日文字幕与初译数量不一致，无法进行精修")
+    if confidence_scores is not None and len(confidence_scores) != len(ja_batch):
+        raise ValueError("Whisper 置信度数量与字幕行数不一致")
     numbers = list(numbers)
     refined = {}
     for start in range(0, len(numbers), max_lines):
@@ -271,17 +289,28 @@ def deepseek_refine(ja_batch, zh_batch, numbers, base_url, key, model,
                  if custom_prompt.strip() else "")
                 + f"\n只精修以下编号的中文译文：{', '.join(map(str, target))}。\n"
                 + context + "\n"
-                + ("每行输入依次为编号、日文原文、日文罗马音、当前中文译文，"
-                   "列之间以制表符分隔。罗马音仅作读音参考，不需输出。"
-                   if romaji_batch is not None else
-                   "每行输入依次为编号、日文原文、当前中文译文，列之间以制表符分隔。")
+                + (
+                    "每行输入依次为编号、日文原文、日文罗马音、当前中文译文、"
+                    "Whisper置信度概率近似值，列之间以制表符分隔。"
+                    "罗马音和置信度仅作参考，不需输出。"
+                    if romaji_batch is not None and confidence_scores is not None else
+                    "每行输入依次为编号、日文原文、日文罗马音、当前中文译文，"
+                    "列之间以制表符分隔。罗马音仅作读音参考，不需输出。"
+                    if romaji_batch is not None else
+                    "每行输入依次为编号、日文原文、当前中文译文、"
+                    "Whisper置信度概率近似值，列之间以制表符分隔；"
+                    "置信度仅作参考，不需输出。"
+                    if confidence_scores is not None else
+                    "每行输入依次为编号、日文原文、当前中文译文，列之间以制表符分隔。"
+                )
                 +
                 "只修正中文译文，不修改日文原文；不添加上下文之外的信息。"
                 "严格按每个编号输出一行，编号和译文之间用真正的制表符分隔，例如：1\t你好。"
                 "不要解释。\n"
                 "待精修条目：\n"
                 + _numbered_pair_subset(
-                    ja_batch, zh_batch, target, romaji_items=romaji_batch)
+                    ja_batch, zh_batch, target, romaji_items=romaji_batch,
+                    confidence_scores=confidence_scores)
             )
             return _deepseek_request(
                 "你是日语广播字幕的中文精修员。准确检查原文与译文，"
@@ -362,12 +391,18 @@ def _cue_span(cues, numbers):
 
 
 def _numbered_pair_subset(ja_items, zh_items, numbers, cues=None,
-                          romaji_items=None):
+                          romaji_items=None, confidence_scores=None):
     def row(i):
         fields = [str(i), ja_items[i - 1].replace(chr(10), " ")]
         if romaji_items is not None:
             fields.append(romaji_items[i - 1].replace(chr(10), " "))
         fields.append(zh_items[i - 1].replace(chr(10), " "))
+        if confidence_scores is not None:
+            score = confidence_scores[i - 1]
+            fields.append(
+                f"约{_confidence_percent(score):.1f}%"
+                if score is not None else "未提供"
+            )
         return "\t".join(fields)
 
     if cues:
@@ -561,7 +596,10 @@ def _merge_short_cues(cues, translations, max_chars=12, max_gap=0.5, max_group=3
         first, last = group[0][0], group[-1][0]
         japanese = " / ".join(c.text.replace("\n", " ").strip() for c, _ in group)
         chinese = " / ".join(t.strip() for _, t in group)
-        merged.append(Cue(first.index, first.start, last.end, f"{japanese}\n{chinese}"))
+        scores = [c.avg_logprob for c, _ in group if c.avg_logprob is not None]
+        merged.append(Cue(first.index, first.start, last.end,
+                          f"{japanese}\n{chinese}",
+                          min(scores) if scores else None))
     return merged
 
 
@@ -573,9 +611,28 @@ def _proofread_results_to_cues(cues, rows):
             continue
         first = cues[row.indices[0] - 1]
         last = cues[row.indices[-1] - 1]
-        outputs.append(Cue(first.index, first.start, last.end, row.japanese))
+        scores = [
+            cues[index - 1].avg_logprob
+            for index in row.indices
+            if cues[index - 1].avg_logprob is not None
+        ]
+        outputs.append(Cue(first.index, first.start, last.end, row.japanese,
+                           min(scores) if scores else None))
         translations.append(row.chinese)
     return outputs, translations
+
+
+def _annotate_low_confidence(cues, threshold):
+    annotated = []
+    for cue in cues:
+        text = cue.text
+        if cue.avg_logprob is not None and cue.avg_logprob <= threshold:
+            japanese, separator, chinese = text.rpartition("\n")
+            percent = _confidence_percent(cue.avg_logprob)
+            note = f"【Whisper低置信度：约{percent:.1f}%（模型概率近似值）】"
+            text = f"{japanese}\n{note}\n{chinese}" if separator else f"{text}\n{note}"
+        annotated.append(Cue(cue.index, cue.start, cue.end, text))
+    return annotated
 
 
 def main(argv=None):
@@ -586,6 +643,10 @@ def main(argv=None):
     p.add_argument("--zh-srt", help="中文初译 SRT；指定后校对初译，否则直接翻译日文")
     p.add_argument("--suspects-only", action="store_true",
                    help="只对质量门控标记的可疑/疑难初译调用 DeepSeek")
+    p.add_argument("--confidence-threshold", type=float,
+                   default=float(env("WHISPER_CONFIDENCE_THRESHOLD",
+                                     str(DEFAULT_CONFIDENCE_THRESHOLD))),
+                   help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 -0.75）")
     p.add_argument("-o", "--output",
                    help="中日最终字幕输出，默认 <名称>.zh-ja.srt；另生成 -romaji.srt 校对稿")
     p.add_argument("--proofread-lines", type=int,
@@ -620,6 +681,8 @@ def main(argv=None):
     p.add_argument("--merge-gap", type=float, default=0.5,
                    help="短句合并允许的最大字幕间隔秒数（默认 0.5）")
     args = p.parse_args(argv)
+    if not math.isfinite(args.confidence_threshold):
+        fail("--confidence-threshold 必须是有限数字")
     if args.proofread_lines < 1:
         fail("--proofread-lines 必须大于 0")
     if args.proofread_max_tokens < 1:
@@ -682,7 +745,10 @@ def main(argv=None):
             if len(drafts) != len(cues):
                 fail(f"中文初译条数 ({len(drafts)}) 与日文字幕条数 ({len(cues)}) 不一致")
             if args.suspects_only:
-                flags = _quality_gate(japanese, drafts, terms)
+                confidence_scores = [cue.avg_logprob for cue in cues]
+                flags = _quality_gate(
+                    japanese, drafts, terms, confidence_scores,
+                    args.confidence_threshold)
                 suspect_numbers = [
                     number for number, flag in flags.items() if flag == "suspect"
                 ]
@@ -701,7 +767,7 @@ def main(argv=None):
                         japanese, drafts, refine_numbers, args.deepseek_base_url,
                         key, args.deepseek_chat_model, args.proofread_lines,
                         "disabled", args.proofread_max_tokens, custom_prompt,
-                        token_usage, romaji)
+                        token_usage, romaji, confidence_scores)
                     for number, translation in translations_by_number.items():
                         translations[number - 1] = translation
                 source_cues = cues
@@ -748,8 +814,9 @@ def main(argv=None):
             cue.index, cue.start, cue.end,
             f"{japanese}\n{_romanize_japanese(japanese)}\n{chinese}",
         ))
-    write_srt(output_cues, out)
-    write_srt(review_cues, romaji_out)
+    output_cues = _annotate_low_confidence(output_cues, args.confidence_threshold)
+    write_srt(output_cues, out, include_confidence=False)
+    write_srt(review_cues, romaji_out, include_confidence=False)
     print(out)
     print(romaji_out)
 

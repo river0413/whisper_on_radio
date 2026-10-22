@@ -3,6 +3,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,7 @@ class Cue:
     start: str
     end: str
     text: str
+    avg_logprob: float | None = None
 
 
 def format_ts(seconds):
@@ -47,6 +49,9 @@ def format_ts(seconds):
 
 
 _TS = re.compile(r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})")
+_AVG_LOGPROB_SUFFIX = re.compile(
+    r"[ \t]*<(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)->[ \t]*$"
+)
 
 
 def parse_srt(text):
@@ -58,16 +63,32 @@ def parse_srt(text):
             m = _TS.search(line)
             if m:
                 body = "\n".join(lines[i + 1:]).strip()
+                avg_logprob = None
+                body_lines = body.splitlines()
+                if body_lines:
+                    confidence_match = _AVG_LOGPROB_SUFFIX.search(body_lines[-1])
+                    if confidence_match:
+                        candidate = float(confidence_match.group(1))
+                        if isfinite(candidate):
+                            avg_logprob = candidate
+                            body_lines[-1] = body_lines[-1][:confidence_match.start()].rstrip()
+                            body = "\n".join(body_lines).strip()
                 cues.append(Cue(len(cues) + 1, m.group(1).replace(".", ","),
-                                m.group(2).replace(".", ","), body))
+                                m.group(2).replace(".", ","), body, avg_logprob))
                 break
     return cues
 
 
-def write_srt(cues, path):
+def write_srt(cues, path, include_confidence=True):
     out = []
     for i, c in enumerate(cues, 1):
-        out.append(f"{i}\n{c.start} --> {c.end}\n{c.text}\n")
+        text = c.text
+        if include_confidence and c.avg_logprob is not None:
+            lines = text.splitlines()
+            if lines:
+                lines[-1] = f"{lines[-1]} <{c.avg_logprob!r}->"
+                text = "\n".join(lines)
+        out.append(f"{i}\n{c.start} --> {c.end}\n{text}\n")
     Path(path).write_text("\n".join(out), encoding="utf-8")
 
 
@@ -75,7 +96,10 @@ def merge_bilingual(cues, translations):
     """Each cue: Japanese line followed by Chinese line."""
     if len(cues) != len(translations):
         raise ValueError("字幕与译文数量不一致")
-    return [Cue(c.index, c.start, c.end, f"{c.text}\n{t}") for c, t in zip(cues, translations)]
+    return [
+        Cue(c.index, c.start, c.end, f"{c.text}\n{t}", c.avg_logprob)
+        for c, t in zip(cues, translations)
+    ]
 
 
 def numbered(items):

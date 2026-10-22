@@ -60,7 +60,8 @@ def _split_long_cue(cue, max_duration):
         part_start = start + min(part * max_duration, duration)
         part_end = start + min((part + 1) * max_duration, duration)
         result.append(Cue(
-            cue.index, format_ts(part_start), format_ts(part_end), part_text
+            cue.index, format_ts(part_start), format_ts(part_end), part_text,
+            cue.avg_logprob,
         ))
     return result
 
@@ -86,8 +87,13 @@ def _prepare_transcription_segments(segments):
                 and segment.avg_logprob < SHORT_CUE_AVG_LOGPROB_THRESHOLD):
             continue
 
+        avg_logprob = getattr(segment, "avg_logprob", None)
+        if avg_logprob is not None:
+            avg_logprob = float(avg_logprob)
+            if not math.isfinite(avg_logprob):
+                avg_logprob = None
         cue = Cue(len(cues) + 1, format_ts(segment.start),
-                  format_ts(segment.end), text)
+                  format_ts(segment.end), text, avg_logprob)
         cues.append(cue)
         if is_short:
             short_cue_indices.add(cue.index)
@@ -102,12 +108,15 @@ def _merge_sentence_cues(cues, max_gap=1.0, max_duration=MAX_CUE_DURATION,
     current_start = current_end = None
     current_index = 0
     current_has_short_cue = False
+    current_logprobs = []
     if short_cue_indices is None:
         short_cue_indices = set()
 
     def flush():
         if current_text:
-            merged.append(Cue(current_index, current_start, current_end, current_text))
+            avg_logprob = min(current_logprobs) if current_logprobs else None
+            merged.append(Cue(current_index, current_start, current_end,
+                              current_text, avg_logprob))
 
     split_cues = (
         (part, cue.index in short_cue_indices)
@@ -126,6 +135,7 @@ def _merge_sentence_cues(cues, max_gap=1.0, max_duration=MAX_CUE_DURATION,
                 flush()
                 current_text = ""
                 current_has_short_cue = False
+                current_logprobs = []
         if not current_text:
             current_index = cue.index
             current_start = cue.start
@@ -135,6 +145,8 @@ def _merge_sentence_cues(cues, max_gap=1.0, max_duration=MAX_CUE_DURATION,
             separator = " " if current_text[-1:].isascii() and cue.text[:1].isascii() else ""
             current_text += separator + cue.text.strip()
             current_has_short_cue = current_has_short_cue or is_short_cue
+        if cue.avg_logprob is not None:
+            current_logprobs.append(cue.avg_logprob)
         current_end = cue.end
     flush()
     return merged
@@ -166,9 +178,14 @@ def main(argv=None):
                    help="VAD 切分的最小静音毫秒数（默认 500）")
     p.add_argument("--sentence-gap", type=float, default=1.0,
                    help="合并同一句字幕允许的最大片段间隔秒数（默认 1.0）")
+    p.add_argument("--max-duration", type=float,
+                   help="仅转录音频开头指定秒数；用于短样本评估")
     args = p.parse_args(argv)
     if args.sentence_gap < 0:
         fail("--sentence-gap 不能小于 0")
+    if args.max_duration is not None and (
+            not math.isfinite(args.max_duration) or args.max_duration <= 0):
+        fail("--max-duration 必须是有限且大于 0 的秒数")
 
     audio = Path(args.audio)
     if not audio.is_file():
@@ -185,7 +202,7 @@ def main(argv=None):
         options = dict(
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": args.vad_min_silence},
-            log_progress=True,
+            log_progress=args.max_duration is None,
             beam_size=5,
         )
         if args.initial_prompt:
@@ -197,17 +214,22 @@ def main(argv=None):
             options["condition_on_previous_text"] = False
         if args.hallucination_silence_threshold > 0:
             options["hallucination_silence_threshold"] = args.hallucination_silence_threshold
+        if args.max_duration is not None:
+            options["clip_timestamps"] = [0, args.max_duration]
         segments, info = model.transcribe(str(audio), language="ja", **options)
         transcription_segments = []
-        with tqdm(total=info.duration, desc="Whisper 转录", unit="s",
+        progress_duration = min(info.duration, args.max_duration) \
+            if args.max_duration is not None else info.duration
+        with tqdm(total=progress_duration, desc="Whisper 转录", unit="s",
                   file=sys.stderr) as progress:
             for s in segments:
                 transcription_segments.append(s)
-                if s.end > progress.n:
-                    progress.update(s.end - progress.n)
+                progress_end = min(s.end, progress_duration)
+                if progress_end > progress.n:
+                    progress.update(progress_end - progress.n)
                 progress.set_postfix_str(f"{len(transcription_segments)} 个片段")
-            if info.duration and progress.n < info.duration:
-                progress.update(info.duration - progress.n)
+            if progress_duration and progress.n < progress_duration:
+                progress.update(progress_duration - progress.n)
         cues, short_cue_indices = _prepare_transcription_segments(
             transcription_segments)
         return _merge_sentence_cues(

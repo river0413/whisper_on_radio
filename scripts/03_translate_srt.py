@@ -156,7 +156,10 @@ def main(argv=None):
     else:
         stem = src.name[:-len(".ja.srt")] if src.name.endswith(".ja.srt") else src.stem
         out = src.with_name(stem + ".zh.srt")
-    write_srt([Cue(c.index, c.start, c.end, t) for c, t in zip(cues, translations)], out)
+    write_srt([
+        Cue(c.index, c.start, c.end, t, c.avg_logprob)
+        for c, t in zip(cues, translations)
+    ], out)
     print(out)
 
 

@@ -30,6 +30,20 @@ def test_roundtrip(tmp_path):
     assert again[1].text == "ありがとう\n谢谢"
 
 
+def test_srt_confidence_metadata_roundtrips_without_becoming_caption_text(tmp_path):
+    cue = parse_srt(SRT)[0]
+    cue.avg_logprob = -0.754321
+    path = tmp_path / "confidence.ja.srt"
+
+    write_srt([cue], path)
+
+    contents = path.read_text(encoding="utf-8")
+    assert "こんにちは <-0.754321->" in contents
+    parsed = parse_srt(contents)[0]
+    assert parsed.text == "こんにちは"
+    assert parsed.avg_logprob == pytest.approx(-0.754321)
+
+
 def test_merge_mismatch():
     with pytest.raises(ValueError):
         merge_bilingual(parse_srt(SRT), ["x"])
@@ -286,6 +300,20 @@ def test_short_transcription_merges_with_neighbors_on_both_sides():
     )
 
 
+def test_transcription_merging_keeps_worst_whisper_score():
+    m = load("02_transcribe_srt")
+    cues, short_indices = m._prepare_transcription_segments([
+        _transcription_segment(0, 1.5, "前の文", avg_logprob=-0.2),
+        _transcription_segment(1.6, 2.5, "低置信度", avg_logprob=-0.9),
+        _transcription_segment(2.6, 4.5, "后面的文。", avg_logprob=-0.4),
+    ])
+
+    merged = m._merge_sentence_cues(cues, short_cue_indices=short_indices)
+
+    assert len(merged) == 1
+    assert merged[0].avg_logprob == pytest.approx(-0.9)
+
+
 def test_short_transcription_does_not_merge_across_long_gap_or_sentence_end():
     m = load("02_transcribe_srt")
     cues, short_indices = m._prepare_transcription_segments([
@@ -347,13 +375,46 @@ def test_transcription_fails_if_cleanup_removes_every_segment(monkeypatch, tmp_p
     assert "清洗后没有可输出的字幕" in capsys.readouterr().err
 
 
+def test_transcription_short_trial_limits_whisper_and_writes_logprob_metadata(
+        monkeypatch, tmp_path):
+    m = load("02_transcribe_srt")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    options_seen = []
+
+    class WhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, path, **kwargs):
+            options_seen.append(kwargs)
+            return [
+                _transcription_segment(0, 1.2, "試験の字幕", avg_logprob=-0.82)
+            ], SimpleNamespace(duration=900.0)
+
+    monkeypatch.setattr(m, "load_env", lambda: None)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        SimpleNamespace(WhisperModel=WhisperModel))
+
+    m.main([str(audio), "--max-duration", "300"])
+
+    assert options_seen[0]["clip_timestamps"] == [0, 300.0]
+    assert options_seen[0]["log_progress"] is False
+    output = (tmp_path / "input.ja.srt").read_text(encoding="utf-8")
+    assert "試験の字幕 <-0.82->" in output
+    parsed = parse_srt(output)[0]
+    assert parsed.text == "試験の字幕"
+    assert parsed.avg_logprob == pytest.approx(-0.82)
+
+
 def test_transcription_cues_are_split_at_five_seconds():
     m = load("02_transcribe_srt")
     cues = parse_srt(
-        "1\n00:00:00,000 --> 00:00:12,000\nABCDEFGHIJKL\n"
+        "1\n00:00:00,000 --> 00:00:12,000\nABCDEFGHIJKL <-0.8->\n"
     )
     split = m._merge_sentence_cues(cues)
     assert [cue.text for cue in split] == ["ABCDE", "FGHIJ", "KL"]
+    assert [cue.avg_logprob for cue in split] == [-0.8, -0.8, -0.8]
     assert [(cue.start, cue.end) for cue in split] == [
         ("00:00:00,000", "00:00:05,000"),
         ("00:00:05,000", "00:00:10,000"),
@@ -419,6 +480,29 @@ def test_translate_writes_chinese_srt(tmp_path, monkeypatch):
     assert out[1].start == "00:00:02,000"
 
 
+def test_local_translation_does_not_receive_confidence_suffix(tmp_path, monkeypatch):
+    m = load("03_translate_srt")
+    source = tmp_path / "confidence.ja.srt"
+    source.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nこんにちは <-0.8->\n",
+        encoding="utf-8",
+    )
+    sent = []
+    monkeypatch.setattr(
+        m, "ollama_translate",
+        lambda batch, *args, **kwargs: sent.extend(batch) or ["你好"],
+    )
+
+    m.main([str(source)])
+
+    assert sent == ["こんにちは"]
+    translated = parse_srt(
+        (tmp_path / "confidence.zh.srt").read_text(encoding="utf-8")
+    )[0]
+    assert translated.text == "你好"
+    assert translated.avg_logprob == pytest.approx(-0.8)
+
+
 def test_quality_gate_marks_suspect_and_hard_translation_rows():
     m = load("04_proofread_srt")
     flags = m._quality_gate(
@@ -451,6 +535,18 @@ def test_quality_gate_detects_missing_glossary_translation():
     assert flags == {2: "suspect"}
 
 
+def test_quality_gate_marks_low_confidence_and_keeps_hard_priority():
+    m = load("04_proofread_srt")
+
+    flags = m._quality_gate(
+        ["普通日文", "これはそれ"],
+        ["普通翻译", "这是那个"],
+        confidence_scores=[-0.75, -0.9],
+    )
+
+    assert flags == {1: "suspect", 2: "hard"}
+
+
 def test_deepseek_refinement_includes_only_target_pairs_and_adjacent_japanese_context(
         monkeypatch):
     m = load("04_proofread_srt")
@@ -480,6 +576,59 @@ def test_deepseek_refinement_includes_only_target_pairs_and_adjacent_japanese_co
     assert "3\t相邻句三" in prompt
     assert "上下文译文一" not in prompt
     assert "上下文译文三" not in prompt
+
+
+def test_deepseek_refinement_receives_confidence_as_separate_metadata(monkeypatch):
+    m = load("04_proofread_srt")
+    calls = []
+
+    def request(system_prompt, user_prompt, base_url, key, model, thinking,
+                max_tokens, token_usage):
+        calls.append(user_prompt)
+        return "1\t精修"
+
+    monkeypatch.setattr(m, "_deepseek_request", request)
+    m.deepseek_refine(
+        ["原文"], ["初译"], [1], "url", "key", "model",
+        romaji_batch=["genbun"], confidence_scores=[-0.75],
+    )
+
+    assert "原文\tgenbun\t初译\t约47.2%" in calls[0]
+    assert "<-0.75->" not in calls[0]
+
+
+def test_final_output_marks_low_confidence_but_not_raw_logprob(tmp_path, monkeypatch):
+    m = load("04_proofread_srt")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    source = tmp_path / "marked.ja.srt"
+    source.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n普通日文 <-0.75->\n",
+        encoding="utf-8",
+    )
+    zh = tmp_path / "marked.zh.srt"
+    zh.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n普通翻译\n",
+        encoding="utf-8",
+    )
+    requests = []
+
+    def refine(ja, drafts, numbers, *args):
+        requests.append((ja, numbers))
+        return {number: "精修译文" for number in numbers}
+
+    monkeypatch.setattr(m, "deepseek_refine", refine)
+    m.main([
+        str(source), "--zh-srt", str(zh), "--suspects-only",
+        "--no-merge-short", "--no-token-usage",
+    ])
+
+    output_text = (tmp_path / "marked.zh-ja.srt").read_text(encoding="utf-8")
+    assert requests == [(["普通日文"], [1])]
+    assert "【Whisper低置信度：约47.2%（模型概率近似值）】" in output_text
+    assert "<-0.75->" not in output_text
+    assert parse_srt(output_text)[0].text == (
+        "普通日文\n【Whisper低置信度：约47.2%（模型概率近似值）】\n精修译文"
+    )
 
 
 def test_suspects_only_routes_all_flags_to_chat_and_preserves_other_rows(
