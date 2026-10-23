@@ -30,7 +30,7 @@ def _timestamp_seconds(value):
 
 
 def _ends_sentence(text):
-    return text.rstrip("」』”’\"')]}）】").endswith(("。", "！", "？", "!", "?"))
+    return text.rstrip("」』”’\"')]}）>").endswith(("。", "！", "？", "!", "?"))
 
 
 def _split_long_cue(cue, max_duration):

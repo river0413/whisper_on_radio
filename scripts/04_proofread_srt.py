@@ -154,7 +154,7 @@ _JAPANESE_PRONOUNS = (
 )
 _PROOFREAD_INTERJECTIONS = {"啊", "嗯", "哦", "哎", "唉", "欸", "诶", "喂", "哈"}
 _ROMANIZER = kakasi()
-DEFAULT_CONFIDENCE_THRESHOLD = -0.75
+DEFAULT_CONFIDENCE_THRESHOLD = math.log(0.85)
 
 
 def _confidence_percent(avg_logprob):
@@ -400,7 +400,7 @@ def _numbered_pair_subset(ja_items, zh_items, numbers, cues=None,
         if confidence_scores is not None:
             score = confidence_scores[i - 1]
             fields.append(
-                f"约{_confidence_percent(score):.1f}%"
+                f"{_confidence_percent(score):.1f}%"
                 if score is not None else "未提供"
             )
         return "\t".join(fields)
@@ -629,8 +629,8 @@ def _annotate_low_confidence(cues, threshold):
         if cue.avg_logprob is not None and cue.avg_logprob <= threshold:
             japanese, separator, chinese = text.rpartition("\n")
             percent = _confidence_percent(cue.avg_logprob)
-            note = f"【Whisper低置信度：约{percent:.1f}%（模型概率近似值）】"
-            text = f"{japanese}\n{note}\n{chinese}" if separator else f"{text}\n{note}"
+            note = f"<low conf：{percent:.1f}%（概率近似）>"
+            text = f"{japanese}{note}\n{chinese}" if separator else f"{text}{note}"
         annotated.append(Cue(cue.index, cue.start, cue.end, text))
     return annotated
 
@@ -646,7 +646,7 @@ def main(argv=None):
     p.add_argument("--confidence-threshold", type=float,
                    default=float(env("WHISPER_CONFIDENCE_THRESHOLD",
                                      str(DEFAULT_CONFIDENCE_THRESHOLD))),
-                   help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 -0.75）")
+                   help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 85%%， -0.1625）")
     p.add_argument("-o", "--output",
                    help="中日最终字幕输出，默认 <名称>.zh-ja.srt；另生成 -romaji.srt 校对稿")
     p.add_argument("--proofread-lines", type=int,

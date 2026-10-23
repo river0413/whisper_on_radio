@@ -116,7 +116,24 @@ python scripts\04_proofread_srt.py ".\work\radio.ja.srt" `
 
 这种模式仍需要 DeepSeek API 密钥；若没有字幕被标记，则不会发送精修请求。门控使用启发式规则筛选，不代表自动确认翻译正确。省略 `--suspects-only` 则执行全量校对；校对过程中模型也可修正日文转录、合并字幕或删除确认无效的条目。
 
-转录生成的 `.ja.srt` 会在字幕行尾保存 Whisper `avg_logprob` 元数据，例如 `<-0.75->`。中文初译不会把该标记发送给本地模型；使用 `--suspects-only` 时，低于或等于默认阈值 `-0.75` 的行也会进入精修，并把置信度作为单独提示及相邻日文上下文提供给 DeepSeek。可用 `--confidence-threshold` 调整阈值。最终双语字幕会在低置信度行中插入百分比提示；该百分比是 `exp(avg_logprob) × 100%` 的模型概率近似值，不是经校准的识别正确率。
+需要在调用 API 前估算输入和字幕输出的 token 数，可单独运行 `scripts\05_token_counter.py`。该工具不发送 API 请求，也不需要 API 密钥：
+
+```powershell
+# 估算日文字幕直接翻译
+python scripts\05_token_counter.py ".\work\radio.ja.srt"
+
+# 估算日文原文与中文初译的校对
+python scripts\05_token_counter.py ".\work\radio.ja.srt" `
+  --zh-srt ".\work\radio.zh.srt" `
+  --proofread-lines 100 `
+  --terms-file ".\terms.json" `
+  --reference-file ".\program-notes.md" `
+  --prompt-file ".\proofreading.md"
+```
+
+输入估算包括系统提示词、字幕批次和提供的参考内容；输出估算按原字幕/初译长度推算。计数基于字符启发式，并非模型 tokenizer 的精确结果；不会包含 API 重试或推理 token。
+
+转录生成的 `.ja.srt` 会在字幕行尾保存 Whisper `avg_logprob` 元数据，例如 `<-0.75->`。中文初译不会把该标记发送给本地模型；使用 `--suspects-only` 时，低于或等于默认阈值 85%（`avg_logprob <= ln(0.85) ≈ -0.1625`）的行也会进入精修，并把置信度作为单独提示及相邻日文上下文提供给 DeepSeek。可用 `--confidence-threshold` 调整阈值。最终双语字幕会在低置信度行的日文后紧接百分比标注，例如 `<low conf：75.2%（概率近似）>`；该百分比是 `exp(avg_logprob) × 100%` 的模型概率近似值，不是经校准的识别正确率。
 
 可用 `--max-duration 300` 只转录音频开头五分钟，便于评估置信度阈值；例如：
 

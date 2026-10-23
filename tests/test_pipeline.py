@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -547,6 +548,16 @@ def test_quality_gate_marks_low_confidence_and_keeps_hard_priority():
     assert flags == {1: "suspect", 2: "hard"}
 
 
+def test_default_confidence_gate_uses_85_percent_threshold():
+    m = load("04_proofread_srt")
+    assert m.DEFAULT_CONFIDENCE_THRESHOLD == pytest.approx(math.log(0.85))
+    assert m._quality_gate(
+        ["普通日文", "普通日文"],
+        ["普通中文", "普通中文"],
+        confidence_scores=[-0.2, -0.15],
+    ) == {1: "suspect"}
+
+
 def test_deepseek_refinement_includes_only_target_pairs_and_adjacent_japanese_context(
         monkeypatch):
     m = load("04_proofread_srt")
@@ -593,7 +604,7 @@ def test_deepseek_refinement_receives_confidence_as_separate_metadata(monkeypatc
         romaji_batch=["genbun"], confidence_scores=[-0.75],
     )
 
-    assert "原文\tgenbun\t初译\t约47.2%" in calls[0]
+    assert "原文\tgenbun\t初译\t47.2%" in calls[0]
     assert "<-0.75->" not in calls[0]
 
 
@@ -624,10 +635,10 @@ def test_final_output_marks_low_confidence_but_not_raw_logprob(tmp_path, monkeyp
 
     output_text = (tmp_path / "marked.zh-ja.srt").read_text(encoding="utf-8")
     assert requests == [(["普通日文"], [1])]
-    assert "【Whisper低置信度：约47.2%（模型概率近似值）】" in output_text
+    assert "<low conf：47.2%（概率近似）>" in output_text
     assert "<-0.75->" not in output_text
     assert parse_srt(output_text)[0].text == (
-        "普通日文\n【Whisper低置信度：约47.2%（模型概率近似值）】\n精修译文"
+        "普通日文<low conf：47.2%（概率近似）>\n精修译文"
     )
 
 
@@ -803,6 +814,35 @@ def test_token_usage_does_not_apply_legacy_prices_to_chat_or_reasoner(capsys):
     assert "deepseek-chat: 输入 12、输出 3" in report
     assert "deepseek-reasoner: 输入 8、输出 2" in report
     assert "未估价模型不计入费用" in report
+
+
+def test_token_counter_estimates_input_and_output_by_batches():
+    m = load("05_token_counter")
+    cues = parse_srt(SRT)
+
+    translated = m.estimate_job(cues, batch_size=1)
+    proofread = m.estimate_job(cues, ["你好", "谢谢"], batch_size=1)
+
+    assert translated["mode"] == "translate"
+    assert translated["requests"] == 2
+    assert translated["input_tokens"] > 0
+    assert translated["output_tokens"] > 0
+    assert proofread["mode"] == "proofread"
+    assert proofread["requests"] == 2
+    assert proofread["input_tokens"] > translated["input_tokens"]
+    assert proofread["output_tokens"] > translated["output_tokens"]
+
+
+def test_token_counter_rejects_mismatched_srt_rows():
+    m = load("05_token_counter")
+    with pytest.raises(ValueError, match="条数"):
+        m.estimate_job(parse_srt(SRT), ["只有一条"])
+
+
+def test_token_counter_estimator_handles_cjk_and_ascii():
+    m = load("05_token_counter")
+    assert m.estimate_tokens("你好") == 2
+    assert m.estimate_tokens("hello") == 2
 
 
 def test_deepseek_requests_only_targeted_rows():
