@@ -3,7 +3,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +24,30 @@ def load_env(path=None):
 
 def env(name, default=None):
     return os.environ.get(name, default)
+
+
+def estimate_tokens(text):
+    """Approximate tokens: one per CJK character, four ASCII word chars per token."""
+    tokens = 0
+    ascii_run = 0
+    for char in text:
+        codepoint = ord(char)
+        if (0x3040 <= codepoint <= 0x30FF
+                or 0x3400 <= codepoint <= 0x9FFF
+                or 0xF900 <= codepoint <= 0xFAFF):
+            tokens += ceil(ascii_run / 4)
+            ascii_run = 0
+            tokens += 1
+        elif char.isascii() and (char.isalnum() or char == "_"):
+            ascii_run += 1
+        elif char.isspace():
+            tokens += ceil(ascii_run / 4)
+            ascii_run = 0
+        else:
+            tokens += ceil(ascii_run / 4)
+            ascii_run = 0
+            tokens += 1
+    return tokens + ceil(ascii_run / 4)
 
 
 def fail(msg, code=1):

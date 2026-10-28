@@ -2,12 +2,11 @@
 import argparse
 import importlib.util
 import json
-import math
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import fail, parse_srt  # noqa: E402
+from common import estimate_tokens, fail, parse_srt  # noqa: E402
 
 _SCRIPTS = Path(__file__).resolve().parent
 _TRANSLATION_SYSTEM_PROMPT = (
@@ -31,30 +30,6 @@ def _load_proofread_module():
 
 
 _PROOFREAD = _load_proofread_module()
-
-
-def estimate_tokens(text):
-    """Approximate tokens: one per CJK character, four ASCII word chars per token."""
-    tokens = 0
-    ascii_run = 0
-    for char in text:
-        codepoint = ord(char)
-        if (0x3040 <= codepoint <= 0x30FF
-                or 0x3400 <= codepoint <= 0x9FFF
-                or 0xF900 <= codepoint <= 0xFAFF):
-            tokens += math.ceil(ascii_run / 4)
-            ascii_run = 0
-            tokens += 1
-        elif char.isascii() and (char.isalnum() or char == "_"):
-            ascii_run += 1
-        elif char.isspace():
-            tokens += math.ceil(ascii_run / 4)
-            ascii_run = 0
-        elif not char.isspace():
-            tokens += math.ceil(ascii_run / 4)
-            ascii_run = 0
-            tokens += 1
-    return tokens + math.ceil(ascii_run / 4)
 
 
 def _numbered_subset(items, numbers):

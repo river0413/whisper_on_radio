@@ -92,6 +92,82 @@ def test_context_groups_keep_neighboring_lines_together():
     assert [len(group) for group in m._context_groups(list(range(8)))] == [3, 3, 2]
 
 
+def test_translation_groups_respect_estimated_input_and_context_budgets():
+    m = load("03_translate_srt")
+    items = ["甲" * 20] * 8
+    _, single_input, single_context = m._translation_request_estimate(
+        items[:1], [1], 1, None, m._TRANSLATION_SYSTEM_PROMPT)
+    max_input_tokens = single_input + 10
+    max_context_tokens = single_context + 10
+
+    groups = m._token_limited_groups(
+        items, 1, None, m._TRANSLATION_SYSTEM_PROMPT,
+        max_input_tokens, max_context_tokens)
+
+    assert len(groups) > 1
+    assert [text for _, group in groups for text in group] == items
+    for first_number, group in groups:
+        numbers = list(range(first_number, first_number + len(group)))
+        _, input_tokens, context_tokens = m._translation_request_estimate(
+            group, numbers, first_number, None, m._TRANSLATION_SYSTEM_PROMPT)
+        assert input_tokens <= max_input_tokens
+        assert context_tokens <= max_context_tokens
+
+
+def test_translation_groups_reject_single_caption_over_token_budget():
+    m = load("03_translate_srt")
+    with pytest.raises(ValueError, match="字幕编号 7"):
+        m._token_limited_groups(
+            ["甲"], 7, None, m._TRANSLATION_SYSTEM_PROMPT,
+            max_input_tokens=1, max_context_tokens=100)
+
+
+def test_ensure_ollama_starts_local_service_when_unavailable(monkeypatch):
+    m = load("03_translate_srt")
+    calls = []
+    launched = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def get(url, timeout):
+        calls.append(url)
+        if len(calls) == 1:
+            raise m.requests.ConnectionError("offline")
+        return Response()
+
+    monkeypatch.setattr(m.requests, "get", get)
+    monkeypatch.setattr(m.shutil, "which", lambda command: "ollama.exe")
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kwargs: launched.append(
+        (args, kwargs)
+    ))
+    monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
+
+    m.ensure_ollama("http://127.0.0.1:11434")
+
+    assert calls == [
+        "http://127.0.0.1:11434/api/version",
+        "http://127.0.0.1:11434/api/version",
+    ]
+    assert launched[0][0] == (["ollama.exe", "serve"],)
+    assert launched[0][1]["env"]["OLLAMA_HOST"] == "127.0.0.1:11434"
+
+
+def test_ensure_ollama_reports_missing_local_command(monkeypatch):
+    m = load("03_translate_srt")
+    monkeypatch.setattr(
+        m.requests, "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            m.requests.ConnectionError("offline")
+        ),
+    )
+    monkeypatch.setattr(m.shutil, "which", lambda command: None)
+
+    with pytest.raises(RuntimeError, match="找不到 ollama 命令"):
+        m.ensure_ollama("http://localhost:11434")
+
+
 def test_translation_request_contains_only_requested_numbered_rows(monkeypatch):
     m = load("03_translate_srt")
     calls = []
@@ -120,9 +196,12 @@ def test_translation_request_contains_only_requested_numbered_rows(monkeypatch):
     assert "12\t丙" in messages[1]["content"]
     assert "将以下内容翻译为简体中文" in messages[1]["content"]
     assert "只输出译文" in messages[0]["content"]
+    expected_context = m._translation_request_estimate(
+        ["甲", "乙", "丙"], [10, 11, 12], 10, None,
+        m._TRANSLATION_SYSTEM_PROMPT)[2]
     assert calls[0]["options"] == {
         "top_k": 20, "top_p": 0.6, "temperature": 0.7,
-        "repeat_penalty": 1.05,
+        "repeat_penalty": 1.05, "num_ctx": expected_context,
     }
 
 
@@ -184,14 +263,15 @@ def test_translation_main_loads_markdown_reference(tmp_path, monkeypatch):
     calls = []
 
     def translate(batch, host, model, **kwargs):
-        calls.append(kwargs["reference_text"])
+        calls.append((kwargs["reference_text"], kwargs["num_ctx"]))
         return ["初译"] * len(batch)
 
     monkeypatch.setattr(m, "load_env", lambda: None)
     monkeypatch.setattr(m, "ollama_translate", translate)
-    m.main([str(source), "--reference-file", str(reference)])
+    monkeypatch.setattr(m, "ensure_ollama", lambda host: None)
+    m.main([str(source), "--reference-file", str(reference), "--num-ctx", "1024"])
 
-    assert calls == ["## 主持人\n野中心菜"]
+    assert calls == [("## 主持人\n野中心菜", 1024)]
     assert (tmp_path / "a.zh.srt").is_file()
 
 
@@ -205,6 +285,14 @@ def test_translation_main_rejects_empty_markdown_reference(tmp_path, monkeypatch
 
     with pytest.raises(SystemExit):
         m.main([str(source), "--reference-file", str(reference)])
+
+
+def test_translation_main_rejects_context_limit_at_or_above_2048(monkeypatch):
+    m = load("03_translate_srt")
+    monkeypatch.setattr(m, "load_env", lambda: None)
+
+    with pytest.raises(SystemExit):
+        m.main(["unused.srt", "--num-ctx", "2048"])
 
 
 def test_transcription_fragments_merge_into_sentences():
@@ -635,11 +723,40 @@ def test_final_output_marks_low_confidence_but_not_raw_logprob(tmp_path, monkeyp
 
     output_text = (tmp_path / "marked.zh-ja.srt").read_text(encoding="utf-8")
     assert requests == [(["普通日文"], [1])]
-    assert "<low conf：47.2%（概率近似）>" in output_text
+    assert "【low conf：47.2%（概率近似）】" in output_text
     assert "<-0.75->" not in output_text
     assert parse_srt(output_text)[0].text == (
-        "普通日文<low conf：47.2%（概率近似）>\n精修译文"
+        "普通日文【low conf：47.2%（概率近似）】\n精修译文"
     )
+
+
+def test_final_subtitle_wraps_long_lines_at_label_and_punctuation():
+    m = load("04_proofread_srt")
+    punctuation_line = "甲" * 43 + "、" + "乙" * 20
+    label = "【low conf：79.8%（概率近似）】"
+    confidence_line = "甲" * 35 + "、" + "乙" * 10 + label
+
+    wrapped = m._wrap_long_line(punctuation_line)
+    wrapped_with_label = m._wrap_long_line(confidence_line)
+
+    assert wrapped == ["甲" * 43 + "、", "乙" * 20]
+    assert wrapped_with_label == ["甲" * 35 + "、" + "乙" * 10, label]
+    assert all(len(line) <= 50 for line in wrapped + wrapped_with_label)
+
+
+def test_final_subtitle_wraps_each_bilingual_line_without_splitting_label():
+    m = load("04_proofread_srt")
+    label = "【low conf：79.8%（概率近似）】"
+    cue = m.Cue(
+        1, "00:00:00,000", "00:00:03,000",
+        "日" * 40 + label + "\n" + "中" * 51,
+    )
+
+    wrapped = m._wrap_long_subtitle_lines([cue])[0]
+    lines = wrapped.text.splitlines()
+
+    assert lines == ["日" * 40, label, "中" * 50, "中"]
+    assert all(len(line) <= 50 for line in lines)
 
 
 def test_suspects_only_routes_all_flags_to_chat_and_preserves_other_rows(

@@ -155,6 +155,9 @@ _JAPANESE_PRONOUNS = (
 _PROOFREAD_INTERJECTIONS = {"啊", "嗯", "哦", "哎", "唉", "欸", "诶", "喂", "哈"}
 _ROMANIZER = kakasi()
 DEFAULT_CONFIDENCE_THRESHOLD = math.log(0.85)
+MAX_SUBTITLE_LINE_LENGTH = 50
+_LOW_CONFIDENCE_LABEL = re.compile(r"【low conf：[^】]*】")
+_WRAP_PUNCTUATION = frozenset("、，,。．.!！?？；;：:」』）)")
 
 
 def _confidence_percent(avg_logprob):
@@ -629,10 +632,39 @@ def _annotate_low_confidence(cues, threshold):
         if cue.avg_logprob is not None and cue.avg_logprob <= threshold:
             japanese, separator, chinese = text.rpartition("\n")
             percent = _confidence_percent(cue.avg_logprob)
-            note = f"<low conf：{percent:.1f}%（概率近似）>"
+            note = f"【low conf：{percent:.1f}%（概率近似）】"
             text = f"{japanese}{note}\n{chinese}" if separator else f"{text}{note}"
         annotated.append(Cue(cue.index, cue.start, cue.end, text))
     return annotated
+
+
+def _wrap_long_line(text, max_chars=MAX_SUBTITLE_LINE_LENGTH):
+    lines = []
+    while len(text) > max_chars:
+        label = _LOW_CONFIDENCE_LABEL.search(text)
+        if label and 0 < label.start() <= max_chars:
+            split_at = label.start()
+        else:
+            punctuation_breaks = [
+                index + 1 for index, char in enumerate(text[:max_chars])
+                if char in _WRAP_PUNCTUATION
+            ]
+            split_at = punctuation_breaks[-1] if punctuation_breaks else max_chars
+        lines.append(text[:split_at])
+        text = text[split_at:]
+    lines.append(text)
+    return lines
+
+
+def _wrap_long_subtitle_lines(cues, max_chars=MAX_SUBTITLE_LINE_LENGTH):
+    wrapped = []
+    for cue in cues:
+        text = "\n".join(
+            line for original in cue.text.splitlines()
+            for line in _wrap_long_line(original, max_chars)
+        )
+        wrapped.append(Cue(cue.index, cue.start, cue.end, text, cue.avg_logprob))
+    return wrapped
 
 
 def main(argv=None):
@@ -646,7 +678,7 @@ def main(argv=None):
     p.add_argument("--confidence-threshold", type=float,
                    default=float(env("WHISPER_CONFIDENCE_THRESHOLD",
                                      str(DEFAULT_CONFIDENCE_THRESHOLD))),
-                   help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 85%%， -0.1625）")
+                   help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 85%%，约 -0.1625）")
     p.add_argument("-o", "--output",
                    help="中日最终字幕输出，默认 <名称>.zh-ja.srt；另生成 -romaji.srt 校对稿")
     p.add_argument("--proofread-lines", type=int,
@@ -815,6 +847,7 @@ def main(argv=None):
             f"{japanese}\n{_romanize_japanese(japanese)}\n{chinese}",
         ))
     output_cues = _annotate_low_confidence(output_cues, args.confidence_threshold)
+    output_cues = _wrap_long_subtitle_lines(output_cues)
     write_srt(output_cues, out, include_confidence=False)
     write_srt(review_cues, romaji_out, include_confidence=False)
     print(out)

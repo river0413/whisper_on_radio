@@ -7,6 +7,8 @@ translate_pdf_hy_mt2.ps1
 work/
 models/
 amanewave术语表.json
+miyake.md
+coconna.md
 
 # Local audio and generated files
 *.aac
