@@ -1,13 +1,9 @@
 .env
-amanewave.md
-修改意见.md
-rin.md
+
 translate_pdf_hy_mt2.ps1
 work/
 models/
-amanewave术语表.json
-miyake.md
-coconna.md
+docs/
 
 # Local audio and generated files
 *.aac
