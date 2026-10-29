@@ -6,12 +6,12 @@
 ```text
 音频
   -> 16 kHz 单声道 WAV
-  -> faster-whisper 日文转录（.ja.srt）
+  -> faster-whisper 或 Qwen3-ASR + ForcedAligner 日文转录（.ja.srt）
   -> Ollama / Hy-MT 中文初译（.zh.srt）
-  -> DeepSeek 校对（.zh-ja.srt 和校对稿）
+  -> DeepSeek 校对（.zh-ja.srt）
 ```
 
-音频转 WAV、Whisper 转录和 Hy-MT 初译都在本机运行。校对步骤会调用 DeepSeek API；一键流程默认校对全部字幕，因此会产生 API 用量。也可以选择只把质量门控标记为可疑或疑难的字幕发送给 API。
+音频转 WAV、ASR 转录和 Hy-MT 初译都在本机运行。默认 ASR 是 faster-whisper；可选安装 Qwen3-ASR-0.6B 与 Qwen3-ForcedAligner-0.6B 后切换后端。Whisper 模式默认会把低置信度片段交给 Qwen 重新识别；校对步骤会调用 DeepSeek API；一键流程默认校对全部字幕，因此会产生 API 用量。也可以选择只把质量门控标记为可疑或疑难的字幕发送给 API。
 
 ## 环境要求
 
@@ -22,6 +22,15 @@
 - DeepSeek API 密钥；用于字幕校对
 
 首次转录时，faster-whisper 会下载所选模型。默认模型为 `large-v3-turbo`，缓存到项目的 `models\` 目录；模型文件较大，不会提交到 Git。
+
+Qwen3 是可选依赖，不会随默认依赖安装。Qwen 的 PyTorch/Transformers 依赖可能与已有环境冲突；建议在独立的 Python 3.12 虚拟环境中安装基础依赖和 Qwen 依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-qwen-asr.txt
+```
+
+Qwen 模型在首次运行时自动下载到 Hugging Face 缓存。默认使用 `Qwen/Qwen3-ASR-0.6B` 和 `Qwen/Qwen3-ForcedAligner-0.6B`；两者均可在 `.env` 中通过 `QWEN3_ASR_MODEL`、`QWEN3_ALIGNER_MODEL` 指定本地目录或其他模型标签。Qwen 后端默认自动选择设备和精度，可通过 `QWEN3_DTYPE`、`WHISPER_DEVICE` 调整。完整 Qwen 流程需要 FFmpeg/ffprobe；长音频会拆成不超过 4 分钟的片段并使用少量重叠，以适配对齐器时长限制。
 
 ## 安装与配置
 
@@ -69,6 +78,24 @@ ollama pull hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M
   -PromptFile ".\proofreading.md"
 ```
 
+ASR 后端默认是 Whisper。可以在本次运行中切换到 Qwen：
+
+```powershell
+.\run_all.ps1 -Audio ".\radio.mp3" -AsrBackend qwen3
+```
+
+也可以在 `.env` 中设置 `ASR_BACKEND=qwen3` 作为默认值；命令行 `-AsrBackend` 优先级更高。单独运行转录脚本时同样支持 `--backend qwen3` 或 `ASR_BACKEND=qwen3`：
+
+```powershell
+python scripts\02_transcribe_srt.py ".\work\radio.wav" --backend qwen3
+```
+
+若使用默认 Whisper 后端但不想自动调用 Qwen 辅助，可在一键流程中传入 `-NoQwenAssist`，或单独运行时传入 `--no-qwen-assist`。
+
+Qwen 后端仍输出标准 `.ja.srt`，可继续用于中文翻译和校对。ForcedAligner 提供的是转录文本的时间戳，不是 Whisper 的 `avg_logprob` 置信度；因此 Qwen 生成的字幕不会带 Whisper 置信度元数据，基于低置信度自动筛选的流程不会将其识别为低置信度字幕。切换模型也不会保证识别结果与 Whisper 相同。
+
+Whisper 后端默认启用低置信度辅助：当单个 Whisper 片段的 `avg_logprob <= ln(0.85) ≈ -0.1625` 时，脚本会用 Qwen3-ASR + ForcedAligner 重识别该片段；模型只在首次遇到此类片段时加载。Qwen 返回有效文本时替换该片段，Qwen 依赖、模型或推理不可用时会显示警告并保留 Whisper 原文。替换后保留的置信度仍是 Whisper 对原片段的评分，不代表 Qwen 置信度。可用 `--no-qwen-assist` 或 `-NoQwenAssist` 关闭本次运行，也可设 `QWEN3_LOW_CONF_ASSIST=0`；阈值与后续低置信度标记共用 `WHISPER_CONFIDENCE_THRESHOLD`，默认等效 0.85。
+
 - `-TermsFile`：UTF-8 JSON 术语表，统一节目名、人名等译法，例如 `{"番組名":"节目名称"}`。
 - `-ReferenceFile`：UTF-8 Markdown 背景资料，供初译和校对参考。
 - `-PromptFile`：UTF-8 Markdown 校对补充要求。
@@ -84,7 +111,6 @@ ollama pull hf.co/tencent/Hy-MT2-7B-GGUF:Q4_K_M
 | `radio.ja.srt` | 日文转录 |
 | `radio.zh.srt` | 中文初译 |
 | `radio.zh-ja.srt` | 最终中日双语字幕，每条先日文后中文 |
-| `radio.zh-ja-romaji.srt` | 校对稿，每条先日文、再罗马音、最后中文 |
 
 `work\`、`models\`、音频文件和 `.env` 均已加入 `.gitignore`，不会随源码提交。首次下载模型或处理长音频时，运行时间和磁盘占用可能较大。
 
@@ -102,7 +128,7 @@ python scripts\02_transcribe_srt.py ".\work\radio.wav"
 # Ollama / Hy-MT 本地初译；默认生成 radio.zh.srt
 python scripts\03_translate_srt.py ".\work\radio.ja.srt"
 
-# 校对初译；默认生成双语字幕和罗马音校对稿
+# 校对初译；默认生成中日双语字幕
 python scripts\04_proofread_srt.py ".\work\radio.ja.srt" `
   --zh-srt ".\work\radio.zh.srt"
 ```
@@ -134,7 +160,7 @@ python scripts\05_token_counter.py ".\work\radio.ja.srt" `
 
 输入估算包括系统提示词、字幕批次和提供的参考内容；输出估算按原字幕/初译长度推算。计数基于字符启发式，并非模型 tokenizer 的精确结果；不会包含 API 重试或推理 token。
 
-转录生成的 `.ja.srt` 会在字幕行尾保存 Whisper `avg_logprob` 元数据，例如 `<-0.75->`。中文初译不会把该标记发送给本地模型；使用 `--suspects-only` 时，低于或等于默认阈值 85%（`avg_logprob <= ln(0.85) ≈ -0.1625`）的行也会进入精修，并把置信度作为单独提示及相邻日文上下文提供给 DeepSeek。可用 `--confidence-threshold` 调整阈值。最终双语字幕会在低置信度行的日文后紧接百分比标注，例如 `【low conf：75.2%（概率近似）】`；该百分比是 `exp(avg_logprob) × 100%` 的模型概率近似值，不是经校准的识别正确率。最终双语 SRT 中，超过 50 个字符的字幕行会自动换行，优先在置信度标签前断行，其次在顿号等标点后断行。
+转录生成的 `.ja.srt` 会在字幕行尾保存 Whisper `avg_logprob` 元数据，例如 `<-0.75->`。启用低置信度 Qwen 辅助时，Qwen 替换文本仍保留原 Whisper 置信度元数据，方便后续复核；元数据表示 Whisper 对原片段的评分，不是 Qwen 的评分。中文初译不会把该标记发送给本地模型；使用 `--suspects-only` 时，低于或等于默认阈值 85%（`avg_logprob <= ln(0.85) ≈ -0.1625`）的行也会进入精修，并把置信度作为单独提示及相邻日文上下文提供给 DeepSeek。可用 `--confidence-threshold` 调整阈值。最终双语字幕会在低置信度行的日文后紧接百分比标注，例如 `【low conf：75.2%（概率近似）】`；该百分比是 `exp(avg_logprob) × 100%` 的模型概率近似值，不是经校准的识别正确率。最终双语 SRT 中，超过 50 个字符的字幕行会自动换行，优先在置信度标签前断行，其次在顿号等标点后断行。
 
 可用 `--max-duration 300` 只转录音频开头五分钟，便于评估置信度阈值；例如：
 

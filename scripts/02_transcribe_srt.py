@@ -1,5 +1,6 @@
-"""Step 2: transcribe Japanese audio with a local Whisper model -> Japanese SRT."""
+"""Step 2: transcribe Japanese audio with a local ASR model -> Japanese SRT."""
 import argparse
+import importlib.util
 import math
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import Cue, ROOT, env, fail, format_ts, load_env, write_srt  # noqa: E402
 
 MAX_CUE_DURATION = 5.0
+DEFAULT_QWEN_ASSIST_THRESHOLD = math.log(0.85)
 SHORT_CUE_DURATION = 1.0
 SHORT_CUE_MAX_GAP = 0.3
 MAX_COMPRESSION_RATIO = 2.4
@@ -152,13 +154,58 @@ def _merge_sentence_cues(cues, max_gap=1.0, max_duration=MAX_CUE_DURATION,
     return merged
 
 
+_QWEN_BACKEND = None
+
+
+def _load_qwen_backend():
+    global _QWEN_BACKEND
+    if _QWEN_BACKEND is not None:
+        return _QWEN_BACKEND
+    module_path = Path(__file__).with_name("021_qwenasr.py")
+    spec = importlib.util.spec_from_file_location("qwen_asr_backend", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 Qwen ASR 模块：{module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _QWEN_BACKEND = module
+    return module
+
+
+def _transcribe_qwen(args, audio):
+    return _load_qwen_backend().transcribe_full(
+        args, audio, _merge_sentence_cues)
+
+
 def main(argv=None):
     load_env()
-    p = argparse.ArgumentParser(description="本地 Whisper 转录日语 -> 日文 SRT")
+    p = argparse.ArgumentParser(description="本地模型转录日语 -> 日文 SRT")
     p.add_argument("audio", help="WAV/音频文件（可用 01_get_audio.py 的输出）")
     p.add_argument("-o", "--output", help="输出 SRT，默认与音频同名 .ja.srt")
+    p.add_argument("--backend", choices=("whisper", "qwen3"),
+                   default=env("ASR_BACKEND", "whisper"),
+                   help="ASR 后端（默认 whisper；也可设 ASR_BACKEND=qwen3）")
     p.add_argument("--model", default=env("WHISPER_MODEL", "large-v3-turbo"),
                    help="模型名或本地模型目录")
+    p.add_argument("--qwen-asr-model",
+                   default=env("QWEN3_ASR_MODEL", "Qwen/Qwen3-ASR-0.6B"),
+                   help="Qwen3 ASR 模型标签或本地目录")
+    p.add_argument("--qwen-aligner-model",
+                   default=env("QWEN3_ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B"),
+                   help="Qwen3 ForcedAligner 模型标签或本地目录")
+    p.add_argument("--qwen-dtype", choices=("auto", "bfloat16", "float16", "float32"),
+                   default=env("QWEN3_DTYPE", "auto"),
+                   help="Qwen 模型精度（默认自动选择）")
+    p.add_argument("--qwen-max-new-tokens", type=int,
+                   default=int(env("QWEN3_MAX_NEW_TOKENS", "2048")),
+                   help="Qwen 每个音频片段的最大生成 token 数")
+    assist_setting = env("QWEN3_LOW_CONF_ASSIST", "1").strip().lower()
+    p.add_argument("--qwen-assist", action=argparse.BooleanOptionalAction,
+                   default=assist_setting not in ("0", "false", "no", "off"),
+                   help="Whisper 低置信度片段默认由 Qwen 重转录；可用 --no-qwen-assist 关闭")
+    p.add_argument("--qwen-assist-threshold", type=float,
+                   default=float(env("WHISPER_CONFIDENCE_THRESHOLD",
+                                     str(DEFAULT_QWEN_ASSIST_THRESHOLD))),
+                   help="低于或等于该 Whisper avg_logprob 时调用 Qwen（默认等效 0.85）")
     p.add_argument("--device", default=env("WHISPER_DEVICE", "auto"))
     p.add_argument("--compute-type", default=env("WHISPER_COMPUTE_TYPE", "auto"))
     p.add_argument("--model-dir", default=env("WHISPER_MODEL_DIR", str(ROOT / "models")),
@@ -181,15 +228,29 @@ def main(argv=None):
     p.add_argument("--max-duration", type=float,
                    help="仅转录音频开头指定秒数；用于短样本评估")
     args = p.parse_args(argv)
+    if args.backend not in ("whisper", "qwen3"):
+        fail(f"不支持的 ASR 后端: {args.backend}")
     if args.sentence_gap < 0:
         fail("--sentence-gap 不能小于 0")
     if args.max_duration is not None and (
             not math.isfinite(args.max_duration) or args.max_duration <= 0):
         fail("--max-duration 必须是有限且大于 0 的秒数")
+    if args.qwen_max_new_tokens <= 0:
+        fail("--qwen-max-new-tokens 必须大于 0")
+    if not math.isfinite(args.qwen_assist_threshold):
+        fail("--qwen-assist-threshold 必须是有限数字")
 
     audio = Path(args.audio)
     if not audio.is_file():
         fail(f"找不到音频: {audio}")
+    if args.backend == "qwen3":
+        cues = _transcribe_qwen(args, audio)
+        if not cues:
+            fail("Qwen forced aligner 未生成可输出的字幕")
+        out = Path(args.output) if args.output else audio.with_suffix(".ja.srt")
+        write_srt(cues, out)
+        print(out)
+        return
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -230,6 +291,9 @@ def main(argv=None):
                 progress.set_postfix_str(f"{len(transcription_segments)} 个片段")
             if progress_duration and progress.n < progress_duration:
                 progress.update(progress_duration - progress.n)
+        if args.qwen_assist:
+            transcription_segments = _load_qwen_backend().assist_low_confidence(
+                args, audio, transcription_segments, args.qwen_assist_threshold)
         cues, short_cue_indices = _prepare_transcription_segments(
             transcription_segments)
         return _merge_sentence_cues(

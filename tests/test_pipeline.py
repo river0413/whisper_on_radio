@@ -1,5 +1,6 @@
 import importlib.util
 import math
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -496,6 +497,395 @@ def test_transcription_short_trial_limits_whisper_and_writes_logprob_metadata(
     assert parsed.avg_logprob == pytest.approx(-0.82)
 
 
+def test_qwen_transcription_uses_forced_aligner_and_writes_compatible_srt(
+        monkeypatch, tmp_path):
+    m = load("02_transcribe_srt")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    model_options = []
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            calls.append(kwargs)
+            return [SimpleNamespace(time_stamps=[
+                SimpleNamespace(text="こんにちは", start_time=0.1, end_time=0.8),
+                SimpleNamespace(text="。", start_time=0.8, end_time=1.0),
+            ])]
+
+    class FakeQwen:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            model_options.append((args, kwargs))
+            return FakeModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            is_bf16_supported=lambda: False,
+        ),
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_asr",
+                        SimpleNamespace(Qwen3ASRModel=FakeQwen))
+    qwen = m._load_qwen_backend()
+    monkeypatch.setattr(qwen.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        qwen.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="5.0"),
+    )
+
+    m.main([str(audio), "--backend", "qwen3", "--initial-prompt", "番組名"])
+
+    assert model_options[0][0] == ("Qwen/Qwen3-ASR-0.6B",)
+    assert model_options[0][1]["forced_aligner"] == "Qwen/Qwen3-ForcedAligner-0.6B"
+    assert calls[0]["language"] == "Japanese"
+    assert calls[0]["return_time_stamps"] is True
+    assert calls[0]["context"] == "番組名"
+    output = (tmp_path / "input.ja.srt").read_text(encoding="utf-8")
+    parsed = parse_srt(output)
+    assert len(parsed) == 1
+    assert parsed[0].text == "こんにちは。"
+    assert parsed[0].avg_logprob is None
+
+
+def test_qwen_transcription_splits_long_audio_and_removes_overlap_duplicates(
+        monkeypatch, tmp_path):
+    m = load("02_transcribe_srt")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    transcribed_paths = []
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            path = Path(kwargs["audio"])
+            transcribed_paths.append(path)
+            if len(transcribed_paths) == 1:
+                stamps = [
+                    SimpleNamespace(text="前段", start_time=238.0, end_time=239.5),
+                ]
+            else:
+                stamps = [
+                    SimpleNamespace(text="重复", start_time=0.2, end_time=0.8),
+                    SimpleNamespace(text="后段", start_time=1.2, end_time=2.0),
+                ]
+            return [SimpleNamespace(time_stamps=stamps)]
+
+    class FakeQwen:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakeModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            is_bf16_supported=lambda: False,
+        ),
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_asr",
+                        SimpleNamespace(Qwen3ASRModel=FakeQwen))
+    qwen = m._load_qwen_backend()
+    monkeypatch.setattr(qwen.shutil, "which", lambda command: command)
+
+    def fake_run(command, **kwargs):
+        if command[0] == "ffprobe":
+            return SimpleNamespace(stdout="241")
+        Path(command[-1]).touch()
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(qwen.subprocess, "run", fake_run)
+
+    cues = m._transcribe_qwen(SimpleNamespace(
+        device="auto",
+        qwen_dtype="auto",
+        qwen_asr_model="asr",
+        qwen_aligner_model="aligner",
+        qwen_max_new_tokens=2048,
+        max_duration=None,
+        initial_prompt="",
+        hotwords="",
+        sentence_gap=0,
+    ), audio)
+
+    assert len(transcribed_paths) == 2
+    assert [cue.text for cue in cues] == ["后段"]
+    assert cues[0].start == "00:03:59,200"
+
+
+def test_qwen_assist_replaces_only_segments_at_equivalent_85_percent(
+        monkeypatch, tmp_path):
+    qwen = load("021_qwenasr")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            calls.append(kwargs)
+            return [SimpleNamespace(
+                text="Qwen 修正",
+                time_stamps=[
+                    SimpleNamespace(text="Qwen", start_time=0.4, end_time=0.7),
+                    SimpleNamespace(text="修正", start_time=0.7, end_time=1.0),
+                ],
+            )]
+
+    class FakeQwen:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakeModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            is_bf16_supported=lambda: False,
+        ),
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_asr",
+                        SimpleNamespace(Qwen3ASRModel=FakeQwen))
+    monkeypatch.setattr(qwen.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        qwen.subprocess, "run",
+        lambda command, **kwargs: Path(command[-1]).touch(),
+    )
+    segments = [
+        _transcription_segment(1.0, 2.0, "Whisper低置信", avg_logprob=math.log(0.85)),
+        _transcription_segment(2.1, 3.0, "Whisper高置信", avg_logprob=math.log(0.851)),
+    ]
+    args = SimpleNamespace(
+        device="auto",
+        qwen_dtype="auto",
+        qwen_asr_model="asr",
+        qwen_aligner_model="aligner",
+        qwen_max_new_tokens=2048,
+        initial_prompt="节目名",
+        hotwords="主持人",
+    )
+
+    updated = qwen.assist_low_confidence(
+        args, audio, segments, threshold=math.log(0.85))
+
+    assert len(calls) == 1
+    assert calls[0]["language"] == "Japanese"
+    assert calls[0]["return_time_stamps"] is True
+    assert "节目名" in calls[0]["context"]
+    assert [segment.text for segment in updated] == ["Qwen 修正", "Whisper高置信"]
+    assert (updated[0].start, updated[0].end) == (1.0, 2.0)
+    assert updated[0].avg_logprob == pytest.approx(math.log(0.85))
+    assert updated[-1] is segments[1]
+
+
+def test_qwen_assist_warns_and_keeps_whisper_if_inference_fails(
+        monkeypatch, tmp_path, capsys):
+    qwen = load("021_qwenasr")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    segment = _transcription_segment(
+        1.0, 2.0, "Whisper原文", avg_logprob=math.log(0.85))
+
+    class FakeModel:
+        def transcribe(self, **kwargs):
+            raise RuntimeError("model unavailable")
+
+    class FakeQwen:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakeModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            is_bf16_supported=lambda: False,
+        ),
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_asr",
+                        SimpleNamespace(Qwen3ASRModel=FakeQwen))
+    monkeypatch.setattr(qwen.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        qwen.subprocess, "run",
+        lambda command, **kwargs: Path(command[-1]).touch(),
+    )
+
+    result = qwen.assist_low_confidence(
+        SimpleNamespace(
+            device="auto",
+            qwen_dtype="auto",
+            qwen_asr_model="asr",
+            qwen_aligner_model="aligner",
+            qwen_max_new_tokens=2048,
+            initial_prompt="",
+            hotwords="",
+        ),
+        audio,
+        [segment],
+        threshold=math.log(0.85),
+    )
+
+    assert result == [segment]
+    error = capsys.readouterr().err
+    assert "警告" in error
+    assert "保留 Whisper 原文" in error
+
+
+def test_whisper_mode_defaults_to_qwen_assist_at_equivalent_85_percent(
+        monkeypatch, tmp_path):
+    m = load("02_transcribe_srt")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+    qwen_calls = []
+
+    class WhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, *args, **kwargs):
+            return [
+                _transcription_segment(0.0, 1.2, "Whisper低置信。",
+                                       avg_logprob=math.log(0.85)),
+                _transcription_segment(1.3, 2.5, "Whisper高置信",
+                                       avg_logprob=math.log(0.851)),
+            ], SimpleNamespace(duration=3.0)
+
+    class QwenModel:
+        def transcribe(self, **kwargs):
+            qwen_calls.append(kwargs)
+            return [SimpleNamespace(
+                text="Qwen修正。",
+                time_stamps=[
+                    SimpleNamespace(text="Qwen修正", start_time=0.2, end_time=0.9),
+                ],
+            )]
+
+    class FakeQwen:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return QwenModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: False,
+            is_bf16_supported=lambda: False,
+        ),
+        bfloat16="bfloat16",
+        float16="float16",
+        float32="float32",
+    )
+    monkeypatch.setattr(m, "load_env", lambda: None)
+    monkeypatch.delenv("QWEN3_LOW_CONF_ASSIST", raising=False)
+    monkeypatch.delenv("WHISPER_CONFIDENCE_THRESHOLD", raising=False)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        SimpleNamespace(WhisperModel=WhisperModel))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "qwen_asr",
+                        SimpleNamespace(Qwen3ASRModel=FakeQwen))
+    qwen = m._load_qwen_backend()
+    monkeypatch.setattr(qwen.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        qwen.subprocess, "run",
+        lambda command, **kwargs: Path(command[-1]).touch(),
+    )
+
+    m.main([str(audio)])
+
+    output = parse_srt((tmp_path / "input.ja.srt").read_text(encoding="utf-8"))
+    assert len(qwen_calls) == 1
+    assert [cue.text for cue in output] == ["Qwen修正。", "Whisper高置信"]
+    assert output[0].avg_logprob == pytest.approx(math.log(0.85))
+
+
+def test_no_qwen_assist_flag_keeps_low_confidence_whisper_segment(
+        monkeypatch, tmp_path):
+    m = load("02_transcribe_srt")
+    audio = tmp_path / "input.wav"
+    audio.touch()
+
+    class WhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, *args, **kwargs):
+            return [
+                _transcription_segment(0.0, 1.2, "Whisper原文",
+                                       avg_logprob=math.log(0.85)),
+            ], SimpleNamespace(duration=1.5)
+
+    monkeypatch.setattr(m, "load_env", lambda: None)
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        SimpleNamespace(WhisperModel=WhisperModel))
+    monkeypatch.setattr(
+        m, "_load_qwen_backend",
+        lambda: pytest.fail("disabled Qwen assist must not load backend"),
+    )
+
+    m.main([str(audio), "--no-qwen-assist"])
+
+    output = parse_srt((tmp_path / "input.ja.srt").read_text(encoding="utf-8"))
+    assert [cue.text for cue in output] == ["Whisper原文"]
+    assert output[0].avg_logprob == pytest.approx(math.log(0.85))
+
+
+def test_embedded_pdf_extractor_saves_raster_and_vector_images(tmp_path):
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        fitz = pytest.importorskip("fitz")
+
+    script = (Path(__file__).resolve().parent.parent /
+              "translate_pdf_hy_mt2.ps1").read_text(encoding="utf-8-sig")
+    match = re.search(r"\$extractor = @'\r?\n(.*?)\r?\n'@", script, re.S)
+    assert match
+    namespace = {"__name__": "embedded_pdf_extractor"}
+    exec(compile(match.group(1), "embedded_pdf_extractor.py", "exec"), namespace)
+
+    pdf_path = tmp_path / "input.pdf"
+    image_path = tmp_path / "images"
+    json_path = tmp_path / "result.json"
+    document = fitz.open()
+    page = document.new_page()
+    paragraph = ("A research paper contains text and figures. " * 8)
+    page.insert_textbox(fitz.Rect(20, 20, 300, 180), paragraph, fontsize=11)
+
+    image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 24, 24), False)
+    image.clear_with(180)
+    page.insert_image(fitz.Rect(350, 40, 430, 120), stream=image.tobytes("png"))
+
+    page.draw_rect(fitz.Rect(80, 260, 240, 370), color=(0, 0, 0), width=1)
+    page.draw_line(fitz.Point(90, 350), fitz.Point(230, 280), color=(1, 0, 0))
+    page.draw_line(fitz.Point(90, 330), fitz.Point(230, 310), color=(0, 0, 1))
+    document.save(pdf_path)
+    document.close()
+
+    original_argv = sys.argv
+    try:
+        sys.argv = [
+            "embedded_pdf_extractor.py", str(pdf_path), str(json_path),
+            "1800", str(image_path),
+        ]
+        namespace["main"]()
+    finally:
+        sys.argv = original_argv
+
+    result = __import__("json").loads(json_path.read_text(encoding="utf-8"))
+    assert {image["kind"] for image in result["images"]} == {"raster", "vector"}
+    assert all((image_path / image["file"]).is_file() for image in result["images"])
+    assert all("bbox" in unit for unit in result["units"])
+
+
 def test_transcription_cues_are_split_at_five_seconds():
     m = load("02_transcribe_srt")
     cues = parse_srt(
@@ -725,6 +1115,7 @@ def test_final_output_marks_low_confidence_but_not_raw_logprob(tmp_path, monkeyp
     assert requests == [(["普通日文"], [1])]
     assert "【low conf：47.2%（概率近似）】" in output_text
     assert "<-0.75->" not in output_text
+    assert not (tmp_path / "marked.zh-ja-romaji.srt").exists()
     assert parse_srt(output_text)[0].text == (
         "普通日文【low conf：47.2%（概率近似）】\n精修译文"
     )

@@ -3,7 +3,9 @@
     [string]$PromptFile,
     [string]$TermsFile,
     [string]$ReferenceFile,
-    [string]$ProofreadThinking
+    [string]$ProofreadThinking,
+    [ValidateSet("whisper", "qwen3")][string]$AsrBackend,
+    [switch]$NoQwenAssist
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -53,7 +55,13 @@ if ($ReferenceFile -and -not (Test-Path $ReferenceFile)) {
 }
 $wav = python "$root\scripts\01_get_audio.py" $Audio
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-$ja = python "$root\scripts\02_transcribe_srt.py" $wav
+$resolvedAsrBackend = $AsrBackend
+if (-not $resolvedAsrBackend) { $resolvedAsrBackend = $env:ASR_BACKEND }
+if (-not $resolvedAsrBackend) { $resolvedAsrBackend = Get-DotEnvValue 'ASR_BACKEND' }
+if (-not $resolvedAsrBackend) { $resolvedAsrBackend = 'whisper' }
+$transcriptionArgs = @($wav, "--backend", $resolvedAsrBackend)
+if ($NoQwenAssist) { $transcriptionArgs += "--no-qwen-assist" }
+$ja = python "$root\scripts\02_transcribe_srt.py" @transcriptionArgs
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $translationArgs = @($ja)
 if ($TermsFile) {

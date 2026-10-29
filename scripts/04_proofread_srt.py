@@ -670,7 +670,7 @@ def _wrap_long_subtitle_lines(cues, max_chars=MAX_SUBTITLE_LINE_LENGTH):
 def main(argv=None):
     load_env()
     p = argparse.ArgumentParser(
-        description="日文 SRT -> 中日最终字幕及罗马音校对稿（DeepSeek 翻译/校对）")
+        description="日文 SRT -> 中日最终字幕（DeepSeek 翻译/校对）")
     p.add_argument("srt", help="日文 SRT")
     p.add_argument("--zh-srt", help="中文初译 SRT；指定后校对初译，否则直接翻译日文")
     p.add_argument("--suspects-only", action="store_true",
@@ -680,7 +680,7 @@ def main(argv=None):
                                      str(DEFAULT_CONFIDENCE_THRESHOLD))),
                    help="Whisper avg_logprob 低于或等于此值时标为可疑（默认 85%%，约 -0.1625）")
     p.add_argument("-o", "--output",
-                   help="中日最终字幕输出，默认 <名称>.zh-ja.srt；另生成 -romaji.srt 校对稿")
+                   help="中日最终字幕输出，默认 <名称>.zh-ja.srt")
     p.add_argument("--proofread-lines", type=int,
                    default=int(env("PROOFREAD_LINES", "200")),
                    help="DeepSeek 每次翻译/校对的字幕条数")
@@ -824,34 +824,14 @@ def main(argv=None):
     out = Path(args.output) if args.output else src.with_name(stem + ".zh-ja.srt")
     if args.no_merge_short:
         output_cues = merge_bilingual(source_cues, translations)
-        review_japanese = [cue.text for cue in source_cues]
-        review_chinese = translations
     else:
         output_cues = _merge_short_cues(source_cues, translations,
                                         max_chars=args.short_cue_chars,
                                         max_gap=args.merge_gap)
-        review_japanese = []
-        review_chinese = []
-        for cue in output_cues:
-            japanese, separator, chinese = cue.text.partition("\n")
-            if not separator:
-                raise ValueError(
-                    f"双语字幕缺少中文行，无法生成罗马音校对稿: {cue.index}")
-            review_japanese.append(japanese)
-            review_chinese.append(chinese)
-    romaji_out = out.with_name(out.stem + "-romaji.srt")
-    review_cues = []
-    for cue, japanese, chinese in zip(output_cues, review_japanese, review_chinese):
-        review_cues.append(Cue(
-            cue.index, cue.start, cue.end,
-            f"{japanese}\n{_romanize_japanese(japanese)}\n{chinese}",
-        ))
     output_cues = _annotate_low_confidence(output_cues, args.confidence_threshold)
     output_cues = _wrap_long_subtitle_lines(output_cues)
     write_srt(output_cues, out, include_confidence=False)
-    write_srt(review_cues, romaji_out, include_confidence=False)
     print(out)
-    print(romaji_out)
 
 
 if __name__ == "__main__":
